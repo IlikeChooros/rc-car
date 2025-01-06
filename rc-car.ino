@@ -6,7 +6,7 @@
 // ------------------------ DEFINES -------------------------------
 
 // For debugging purposes, will send the data back to the bluetooth
-constexpr bool DEBUG = true;
+constexpr bool DEBUG = false;
 
 #define IF_ON_DEBUG if constexpr (DEBUG)
 #define START_MSG "*"
