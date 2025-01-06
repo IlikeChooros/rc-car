@@ -1,15 +1,26 @@
 #include <SoftwareSerial.h>
 #include <Servo.h>
 
-constexpr bool DEBUG = false;
+
+// ----------------------------------------------------------------
+// ------------------------ DEFINES -------------------------------
+
+// For debugging purposes, will send the data back to the bluetooth
+constexpr bool DEBUG = true;
 
 #define IF_ON_DEBUG if constexpr (DEBUG)
+#define START_MSG "*"
+#define END_MSG ";"
+#define DATA_FORMAT "%d %d"
+#define MSG_FORMAT START_MSG""DATA_FORMAT""END_MSG
 
-//Create software serial object to communicate with HC-05
-SoftwareSerial btSerial(3, 2); //HC-05 Tx & Rx is connected to Arduino #3 & #2
+
+// ----------------------------------------------------------------
+// ------------------------ STRUCTS -------------------------------
 
 // For motor controlling
-struct MotorInfo{
+struct MotorInfo
+{
   uint8_t pwm;
   uint8_t prev_pwm;
   bool forward;
@@ -20,21 +31,44 @@ struct MotorInfo{
 };
 
 // For servo controlling
-struct ServoInfo{
+struct ServoInfo
+{
   uint8_t angle; // 0 - 180
   uint8_t prev_angle;
   Servo servo;
 };
 
 // Must be the same as the server
-typedef struct {
-  int16_t pwm;
-  uint8_t rotation;
+typedef struct 
+{
+  int pwm;
+  int rotation;
 } MotorData;
 
-static MotorInfo motor1 = {0, 0, false, true, 6, 7, 8};
-static ServoInfo servo  = {90, 90, Servo()};
-static MotorData motorData = {0, 90};
+// ----------------------------------------------------------------
+// ------------------------ GLOBAL VARIABLES ----------------------
+
+//Create software serial object to communicate with HC-05
+SoftwareSerial btSerial(3, 2); //HC-05 Tx & Rx is connected to Arduino #3 & #2
+
+// For motor controlling
+static MotorInfo motor1     = {0, 0, false, true, 6, 7, 8};
+static ServoInfo servo      = {90, 90, Servo()};
+static MotorData motorData  = {0, 90};
+static uint64_t  servoTime  = 0;
+static uint64_t  servoDelay = 1000;
+
+// For the loop
+constexpr int    MAX_LEN     = 16;
+static uint8_t   loopTimer   = 0;
+static int       buffer_len  = 0;
+static bool      valid_start = false;
+static bool      valid_end   = false;
+static char      buffer[MAX_LEN];
+
+
+// ----------------------------------------------------------------
+// ------------------------ FUNCTIONS -----------------------------
 
 // Set the output modes on the pins
 void setupMotorPinModes(MotorInfo& motor) 
@@ -78,11 +112,30 @@ void updateMotorState()
 // Set the angle of the servo
 void updateServoState()
 {
-  if (servo.angle != servo.prev_angle)
+  // Wait for the servo to reach the desired angle and change it if needed
+  if ((millis() - servoTime < servoDelay))
+    return;
+
+  if (servo.angle == servo.prev_angle)
+    return;
+
+  IF_ON_DEBUG
   {
-    servo.servo.write(servo.angle);
-    servo.prev_angle = servo.angle;
+    String msg = "read-angle: " + String(servo.servo.read()) + "\n";
+    btSerial.write(msg.c_str());
   }
+
+  IF_ON_DEBUG
+  {
+    String msg = "w-angle: " + String(servo.angle) + "\n";
+    btSerial.write(msg.c_str());
+  }
+
+  servo.servo.write(servo.angle);
+
+  servoTime  = millis();
+  servoDelay = max(5 * abs(servo.angle - servo.prev_angle), 30);
+  servo.prev_angle = servo.angle;
 }
 
 // Update all states
@@ -105,6 +158,15 @@ void setupServo()
   servo.angle = 90;
   servo.prev_angle = 90;
   servo.servo.attach(A0);
+  servo.servo.write(servo.angle);
+}
+
+// Get the memory left
+uint16_t memoryLeft()
+{
+  extern int __heap_start, *__brkval;
+  int v;
+  return (uint16_t) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
 }
 
 void setup()
@@ -134,44 +196,79 @@ void writeMotorData()
     setMotorRotation(true, motor1);
   }
   // Set the value of the pwm
-  motor1.pwm = min(255, motorData.pwm);
+  motor1.pwm = motorData.pwm;
 
   // Set the servo angle
-  servo.angle = min(180, motorData.rotation);
+  servo.angle = motorData.rotation;
 }
 
 void loop()
 {
+  constexpr uint8_t LOOP_DELAY = 2;
+
+  // Update the states
+  updateStates();
+
+  // Check the serial every 2 ms (500 Hz)
+  if (millis() - loopTimer < LOOP_DELAY)
+    return;
+
+  loopTimer = millis();
+
   // Read the data from the bluetooth if available
   if(btSerial.available()) 
   {
-    // Wait for full message to be received
-    delay(20);
+    buffer_len = 0;
+    valid_start = valid_end = false;
 
+    // Wait for full message to be received
+    delay(10);
+
+    while(btSerial.available())
+    {
+      int data = btSerial.read();
+
+      if (data == START_MSG[0])
+      {
+        valid_start = true;
+        continue;
+      }
+
+      if (!valid_start)
+        continue;
+
+      if (data == END_MSG[0])
+      {
+        valid_end = true;
+        break;
+      }
+
+      if (++buffer_len < (MAX_LEN - 1))
+        buffer[buffer_len - 1] = data;
+    }
+
+    IF_ON_DEBUG
+    {
+      btSerial.write(buffer, buffer_len);
+    }
+    
+    if (!(valid_end && valid_start))
+      return;
+
+    // Add the end of the string
+    buffer[buffer_len] = '\0';
 
     // For debugging purposes only
     IF_ON_DEBUG
     {
-      String s;
-      while(btSerial.available())
-      {
-        int data = btSerial.read();
-        if (isalnum(data) || data == '-' || data == ' ')
-          s += (char) data;
-      }
-
       // Read the message and set the motor pwm and rotation
-      btSerial.write(s.c_str());
-
-      int pwm, rotation;
-      int scanned = sscanf(s.c_str(), "%d %d", &pwm, &rotation);
+      int scanned = sscanf(buffer, DATA_FORMAT, &motorData.pwm, &motorData.rotation);
 
       // If the message is valid, set the motor pwm and rotation
       if (scanned == 2)
       {
-        motorData.pwm = pwm;
-        motorData.rotation = rotation;
-        btSerial.write("OK\n");
+        btSerial.write("\n");
+        btSerial.println("pwm: " + String(motorData.pwm) + " r: " + String(motorData.rotation));
         writeMotorData();
       }
     }
@@ -180,29 +277,13 @@ void loop()
     else
     {
       // Read the message and set the motor pwm and rotation
-      // int scanned = btSerial.readBytes((char*)&motorData, sizeof(motorData));
-
-      String s;
-      while(btSerial.available())
-      {
-        int data = btSerial.read();
-        if (isalnum(data) || data == '-' || data == ' ')
-          s += (char) data;
-      }
-
-      int pwm, rotation;
-      int scanned = sscanf(s.c_str(), "%d %d", &pwm, &rotation);
+      int scanned = sscanf(buffer, DATA_FORMAT, &motorData.pwm, &motorData.rotation);
 
       // If the message is valid, set the motor pwm and rotation
       if (scanned == 2)
       {
-        motorData.pwm = pwm;
-        motorData.rotation = rotation;
         writeMotorData();
       }
     }
   }
-  updateStates();
-
-  delay(5);
 }
